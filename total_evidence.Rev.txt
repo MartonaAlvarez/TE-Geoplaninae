@@ -1,0 +1,188 @@
+##This is a script to run revbayes for the Total Evidence analysis of Lago-Barcia et al 2021
+
+### Created on Wed March 10 12:00 2021
+### @author: Marta Álvarez-Presas  marta.alvarez-presas@bristol.ac.uk
+
+##Load Data Matrices
+
+morpho <- readDiscreteCharacterData("data/MatrixMorphoDomingo_perconc.nex")
+
+gene28S <- readDiscreteCharacterData("data/28S_final.nex")
+
+gene18S <- readDiscreteCharacterData("data/18S_final.nex")
+
+geneCOI_1 <- readDiscreteCharacterData("data/COI_final.nex")
+geneCOI_1.setCodonPartition( v(1) )
+
+geneCOI_2 <- readDiscreteCharacterData("data/COI_final.nex")
+geneCOI_2.setCodonPartition( v(2) )
+
+geneCOI_3 <- readDiscreteCharacterData("data/COI_final.nex")
+geneCOI_3.setCodonPartition( v(3) )
+
+geneEF_1 <- readDiscreteCharacterData("data/EF_final.nex")
+geneEF_1.setCodonPartition( v(1) )
+
+geneEF_2 <- readDiscreteCharacterData("data/EF_final.nex")
+geneEF_2.setCodonPartition( v(2) )
+
+geneEF_3 <- readDiscreteCharacterData("data/EF_final.nex")
+geneEF_3.setCodonPartition( v(3) )
+
+geneDOM5_1 <- readDiscreteCharacterData("data/DOM5_final.nex")
+geneDOM5_1.setCodonPartition( v(1) )
+
+geneDOM5_2 <- readDiscreteCharacterData("data/DOM5_final.nex")
+geneDOM5_2.setCodonPartition( v(2) )
+
+geneDOM5_3 <- readDiscreteCharacterData("data/DOM5_final.nex")
+geneDOM5_3.setCodonPartition( v(3) )
+
+geneTnuc813 <- readDiscreteCharacterData("data/Tnuc813_final.nex")
+
+
+##Create Helper Variables
+
+taxa <- morpho.names()
+num_taxa <- taxa.size()
+n_branches <- 2 * num_taxa - 3
+
+##Adding moves and monitors
+
+moves = VectorMoves()
+monitors = VectorMonitors()
+
+##Tree Model
+
+topology ~ dnUniformTopology(taxa)
+moves.append( mvNNI(topology, weight=n_branches/2.0) )
+moves.append( mvSPR(topology, weight=n_branches/5.0) )
+
+branch_hypershape ~ dnExponential(1)
+moves.append(mvScale(branch_hypershape))
+
+for (i in 1:n_branches) {
+	bl[i] ~ dnExponential(branch_hypershape)
+	moves.append(mvScale(bl[i]))
+}
+
+TL := sum(bl)
+
+psi := treeAssembly(topology, bl)
+
+##Model of Evolution for nucleotide sequences (GTR+G)
+
+#Making partitions
+
+partition_1 <- concatenate(gene28S, gene18S)
+partition_2 <- concatenate(geneTnuc813, geneCOI_1)
+partition_3 <- concatenate(geneCOI_2, geneEF_2)
+partition_4 <- geneCOI_3
+partition_5 <- concatenate(geneDOM5_2, geneEF_1, geneDOM5_3, geneDOM5_1)
+partition_6 <- geneEF_3
+
+#Combining partitions according to the model
+
+model <- v(partition_1, partition_2, partition_3, partition_4, partition_5, partition_6)
+
+#Number of partitions
+n_data_subsets <- model.size()
+
+
+for (i in 1:n_data_subsets) {
+	er[i] ~ dnDirichlet(v(1,1,1,1,1,1))
+	pi[i] ~ dnDirichlet(v(1,1,1,1))
+	
+	moves.append( mvSimplexElementScale(er[i], alpha=10, tune=true, weight=5) )
+	moves.append( mvSimplexElementScale(pi[i], alpha=10, tune=true, weight=5) )
+ 
+	Q_molec[i] := fnGTR(er[i], pi[i])
+
+	alpha_molec[i] ~ dnExponential( 1.0 )
+
+	rates_molec[i] := fnDiscretizeGamma( alpha_molec[i], alpha_molec[i], 4 )
+	
+	moves.append( mvScale(alpha_molec[i], lambda=0.01, weight=5.0) )
+	moves.append( mvScale(alpha_molec[i], lambda=0.1, weight=3.0) )
+	moves.append( mvScale(alpha_molec[i], lambda=1, weight=1.0) )
+	
+}
+
+#Partition rate multipliers
+
+part_rate_mult ~ dnDirichlet( rep(1.0, n_data_subsets) )
+moves.append( mvBetaSimplex(part_rate_mult, alpha=1.0, tune=true, weight=n_data_subsets) )
+moves.append( mvDirichletSimplex(part_rate_mult, alpha=1.0, tune=true, weight=2.0) )
+part_rate := part_rate_mult * (n_data_subsets)
+
+#Creating the substitution model and clamping it with the observed standard data
+
+for (i in 1:n_data_subsets) {
+	phyloSeq_1[i] ~ dnPhyloCTMC(tree=psi, Q=Q_molec[i], siteRates=rates_molec[i], branchRates=part_rate_mult[i], type="DNA")
+	phyloSeq_1[i].clamp(model[i])
+}
+
+##Modeling the Evolution of Morphological Characters
+
+Q_morpho <- fnJC(4)
+
+alpha_morpho ~ dnExponential( 1.0 )
+rates_morpho := fnDiscretizeGamma( alpha_morpho, alpha_morpho, 4 )
+
+moves.append( mvScale(alpha_morpho, lambda=0.01, weight=5.0) )
+moves.append( mvScale(alpha_morpho, lambda=0.1, weight=3.0) )
+moves.append( mvScale(alpha_morpho, lambda=1, weight=1.0) )
+
+phyMorpho ~ dnPhyloCTMC(tree=psi, siteRates=rates_morpho, Q=Q_morpho, type="Standard", coding="variable")
+phyMorpho.clamp(morpho)
+
+#Creating a Q-matrix for multistate characters, combining all parts into the phyloCTMC, and clamping each partition to each model
+
+n_max_states <- 6
+idx = 1
+morpho_bystate[1] <- morpho
+for (i in 2:n_max_states) {
+	morpho_bystate[i] <- morpho
+	morpho_bystate[i].setNumStatesPartition(i)
+	nc = morpho_bystate[i].nchar()
+
+	if (nc > 0)  {
+		q[idx] <- fnJC(i)
+		m_morph[idx] ~ dnPhyloCTMC(tree=psi, Q=q[idx], nSites=nc, siteRates=rates_morpho, type="Standard", coding="variable")
+
+		m_morph[idx].clamp(morpho_bystate[i])
+
+		idx = idx + 1
+		idx
+	}
+}
+
+##Create Model Object
+
+my_model = model(topology)
+
+##Specify Monitors and Output Filenames
+
+monitors.append( mnModel(filename="output/Mormol.log", printgen=1000))
+
+monitors.append( mnFile(psi, filename="output/Mormol.trees", printgen=1000))
+
+monitors.append( mnScreen(TL, printgen=1000))
+
+##Set-Up the MCMC
+
+mymcmc = mcmc(my_model, monitors, moves, nruns=2, combine="mixed")
+
+mymcmc.burnin(generations=1000, tuningInterval=500)
+
+mymcmc.run(5000000, underPrior=false)
+
+##Summarizing the output
+
+trace = readTreeTrace("output/Mormol.trees", treetype="non-clock")
+
+consensusTree(trace, cutoff=0.5, file="Mormol_consensus.tree")
+
+##Quitting RevBayes
+
+q() 
